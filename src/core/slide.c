@@ -122,6 +122,7 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     {0x08, 0, "tree_right"},
     {0x10, SLIDE_RANDOM_BOOT_ID_DATA, "tree_left"},
     {FAKE_WAITER_TREE_PRIO_OFF, FAKE_WAITER_PRIO, "tree_prio"},
+    {FAKE_WAITER_TREE_DEADLINE_OFF, 0, "tree_deadline"},
     {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00, SLIDE_LOGGERS_0_1, "pi0"},
     {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08, 0, "pi1"},
     {FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10, SLIDE_RANDOM_BOOT_ID_DATA, "pi2"},

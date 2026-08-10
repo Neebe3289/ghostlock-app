@@ -76,6 +76,7 @@ extern const struct kernel_offsets *active_offsets;
 #define INIT_TASK_TASKS (INIT_TASK + TASK_TASKS_OFF)
 #define SECURITY_CAPABLE_HEAD (SECURITY_HOOK_HEADS + 0x40)
 
+#undef FAKE_TASK_USAGE_OFF
 #undef FAKE_TASK_PRIO_OFF
 #undef FAKE_TASK_NORMAL_PRIO_OFF
 #undef FAKE_TASK_TASK_GROUP_OFF
@@ -92,6 +93,7 @@ extern const struct kernel_offsets *active_offsets;
 #undef TASK_TASKS_OFF
 #undef TASK_SECCOMP_OFF
 
+#define FAKE_TASK_USAGE_OFF          _RSO(task_usage, 0x40)
 #define FAKE_TASK_PRIO_OFF           _RSO(task_prio, 0x94)
 #define FAKE_TASK_NORMAL_PRIO_OFF    _RSO(task_normal_prio, 0x9C)
 #define FAKE_TASK_TASK_GROUP_OFF     _RSO(task_sched_task_group, 0x420)

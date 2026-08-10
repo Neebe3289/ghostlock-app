@@ -23,6 +23,7 @@ struct kernel_offsets {
   uint64_t off_slide_nfulnl_logger, off_slide_loggers_0_1, off_slide_boot_id;
 
   /* Per-kernel struct offsets; 0 uses target.h defaults. */
+  uint32_t task_usage;
   uint32_t task_prio, task_normal_prio, task_sched_task_group;
   uint32_t task_pi_lock, task_pi_waiters, task_pi_top_task, task_pi_blocked_on;
   uint32_t task_pid, task_tgid, task_atomic_flags;
@@ -50,6 +51,7 @@ struct kernel_offsets {
 #define OFFSETS_ENTRY(uname, ...) { .uname_r = uname, __VA_ARGS__ }
 
 #define STRUCT_OFFSETS_6_12                                                    \
+  .task_usage = 0x40,                                                          \
   .task_prio = 0x94, .task_normal_prio = 0x9C, .task_sched_task_group = 0x420, \
   .task_pi_lock = 0x9EC, .task_pi_waiters = 0xA00,                             \
   .task_pi_top_task = 0xA10, .task_pi_blocked_on = 0xA18,                      \
@@ -70,6 +72,7 @@ struct kernel_offsets {
   .struct_page_type = 0x30, .struct_slab_cache = 0x08, .struct_mm_struct = 0x500
 
 #define STRUCT_OFFSETS_6_6                                                     \
+  .task_usage = 0x40,                                                          \
   .task_prio = 0x84, .task_normal_prio = 0x8C, .task_sched_task_group = 0x348, \
   .task_pi_lock = 0x90C, .task_pi_waiters = 0x920,                             \
   .task_pi_top_task = 0x930, .task_pi_blocked_on = 0x938,                      \
@@ -90,6 +93,7 @@ struct kernel_offsets {
   .struct_page_type = 0x30, .struct_slab_cache = 0x08, .struct_mm_struct = 0x500
 
 #define STRUCT_OFFSETS_5_15                                                    \
+  .task_usage = 0x38,                                                          \
   .task_prio = 0x7C, .task_normal_prio = 0x84, .task_sched_task_group = 0x400, \
   .task_pi_lock = 0x884, .task_pi_waiters = 0x898,                             \
   .task_pi_top_task = 0x8A8, .task_pi_blocked_on = 0x8B0,                      \
